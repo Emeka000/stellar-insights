@@ -1,15 +1,12 @@
-use anyhow::Result;
-use chrono::Utc;
-use serde::Serialize;
-use sqlx::SqlitePool;
-use crate::admin_audit_log::AdminAuditLogger;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use sqlx::{ConnectOptions, SqlitePool};
 use std::time::Duration;
 use std::time::Instant;
 use uuid::Uuid;
+use crate::admin_audit_log::AdminAuditLogger;
 
 use crate::analytics::compute_anchor_metrics;
 use crate::cache::CacheManager;
@@ -217,20 +214,6 @@ pub struct AnchorMetricsParams {
 }
 
 /// Connection pool metrics
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct PoolMetrics {
-    pub size: u32,
-    pub idle: usize,
-}
-
-pub struct Database {
-    pool: SqlitePool,
-    pub admin_audit_logger: AdminAuditLogger,
-    /// Threshold in milliseconds above which a query is logged as slow at WARN level.
-    /// Loaded from `SLOW_QUERY_THRESHOLD_MS` (default: 100).
-    slow_query_threshold_ms: u64,
-}
-
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct PoolMetrics {
     pub size: u32,
@@ -243,6 +226,14 @@ impl PoolMetrics {
     pub const fn new(size: u32, idle: usize, active: u32) -> Self {
         Self { size, idle, active }
     }
+}
+
+pub struct Database {
+    pool: SqlitePool,
+    pub admin_audit_logger: AdminAuditLogger,
+    /// Threshold in milliseconds above which a query is logged as slow at WARN level.
+    /// Loaded from `SLOW_QUERY_THRESHOLD_MS` (default: 100).
+    slow_query_threshold_ms: u64,
 }
 
 impl Database {
@@ -295,21 +286,11 @@ impl Database {
         let size = self.pool.size();
         let idle = self.pool.num_idle();
         let active = size.saturating_sub(idle as u32);
-
         PoolMetrics::new(size, idle, active)
     }
 
     pub fn corridor_aggregates(&self) -> crate::db::aggregates::CorridorAggregates {
         crate::db::aggregates::CorridorAggregates::new(self.pool.clone())
-    }
-
-    /// Get connection pool metrics
-    #[must_use]
-    pub fn pool_metrics(&self) -> PoolMetrics {
-        PoolMetrics {
-            size: self.pool.size(),
-            idle: self.pool.num_idle(),
-        }
     }
 
     // Anchor operations
@@ -557,7 +538,8 @@ impl Database {
         // Wrap the UPDATE + INSERT history in a single transaction so that
         // a failure recording history cannot leave the anchor row updated
         // without a corresponding history entry.
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin().await
+            .context(format!("Failed to begin transaction for update_anchor_metrics: {}", update.anchor_id))?;
 
         let anchor = sqlx::query_as::<_, Anchor>(
             r"
@@ -582,36 +564,8 @@ impl Database {
         .bind(metrics.status.as_str())
         .bind(update.volume_usd.unwrap_or(0.0))
         .bind(Utc::now())
-        .bind(anchor_id.to_string())
-        .fetch_one(&mut *tx)
-        .await?;
-
-        let history_id = Uuid::new_v4().to_string();
-        sqlx::query(
-            r#"
-            INSERT INTO anchor_metrics_history (
-                id, anchor_id, timestamp, success_rate, failure_rate, reliability_score,
-                total_transactions, successful_transactions, failed_transactions,
-                avg_settlement_time_ms, volume_usd
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-            "#,
-        )
-        .bind(history_id)
-        .bind(anchor_id.to_string())
-        .bind(Utc::now())
-        .bind(metrics.success_rate)
-        .bind(metrics.failure_rate)
-        .bind(metrics.reliability_score)
-        .bind(total_transactions)
-        .bind(successful_transactions)
-        .bind(failed_transactions)
-        .bind(avg_settlement_time_ms.unwrap_or(0))
-        .bind(volume_usd.unwrap_or(0.0))
-        .execute(&mut *tx)
-        .await?;
         .bind(update.anchor_id.to_string())
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .context(format!(
             "Failed to update metrics for anchor: {}",
@@ -636,7 +590,8 @@ impl Database {
             update.anchor_id
         ))?;
 
-        tx.commit().await?;
+        tx.commit().await
+            .context(format!("Failed to commit update_anchor_metrics transaction for anchor: {}", update.anchor_id))?;
 
         Ok(anchor)
     }
@@ -1267,17 +1222,11 @@ impl Database {
     }
 
     pub async fn save_payments(&self, payments: Vec<crate::models::PaymentRecord>) -> Result<()> {
-        let start = Instant::now();
-
-        // Wrap the entire batch in a transaction so a mid-batch failure
-        // doesn't leave a partial set of payments persisted.
-        let mut tx = self.pool.begin().await?;
-
-        for payment in payments {
-            sqlx::query(
-                r#"
         self.execute_with_timing("save_payments", async {
-            for payment in payments {
+            let mut tx = self.pool.begin().await
+                .context("Failed to begin transaction for save_payments")?;
+
+            for payment in &payments {
                 sqlx::query(
                     r"
                 INSERT INTO payments (
@@ -1286,29 +1235,6 @@ impl Database {
                 )
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                 ON CONFLICT (id) DO NOTHING
-                "#,
-            )
-            .bind(&payment.id)
-            .bind(&payment.transaction_hash)
-            .bind(&payment.source_account)
-            .bind(&payment.destination_account)
-            .bind(&payment.asset_type)
-            .bind(&payment.asset_code)
-            .bind(&payment.asset_issuer)
-            .bind(payment.amount)
-            .bind(payment.created_at)
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        tx.commit().await?;
-
-        crate::observability::metrics::observe_db_query(
-            "save_payments",
-            "success",
-            start.elapsed().as_secs_f64(),
-        );
-        Ok(())
                 ",
                 )
                 .bind(&payment.id)
@@ -1320,10 +1246,13 @@ impl Database {
                 .bind(&payment.asset_issuer)
                 .bind(payment.amount)
                 .bind(payment.created_at)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await
                 .context(format!("Failed to save payment id: {}", payment.id))?;
             }
+
+            tx.commit().await
+                .context("Failed to commit save_payments transaction")?;
             Ok(())
         })
         .await
@@ -1826,7 +1755,8 @@ impl Database {
 
         // Revoke the old key and create the new one atomically so we never
         // end up with the old key revoked but no replacement issued.
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin().await
+            .context("Failed to begin transaction for rotate_api_key")?;
 
         sqlx::query(
             r#"
@@ -1839,7 +1769,8 @@ impl Database {
         .bind(id)
         .bind(wallet_address)
         .execute(&mut *tx)
-        .await?;
+        .await
+        .context(format!("Failed to revoke old API key id: {} during rotation", id))?;
 
         let new_id = Uuid::new_v4().to_string();
         let (plain_key, prefix, key_hash) = generate_api_key();
@@ -1861,35 +1792,20 @@ impl Database {
         .bind(&now)
         .bind(&old_key.expires_at)
         .execute(&mut *tx)
-        .await?;
+        .await
+        .context(format!(
+            "Failed to insert new API key during rotation for wallet: {}",
+            wallet_address
+        ))?;
 
-        tx.commit().await?;
+        tx.commit().await
+            .context("Failed to commit rotate_api_key transaction")?;
 
         let new_key = sqlx::query_as::<_, ApiKey>("SELECT * FROM api_keys WHERE id = $1")
             .bind(&new_id)
             .fetch_one(&self.pool)
-            .await?;
-        self.revoke_api_key(id, wallet_address)
             .await
-            .context(format!(
-                "Failed to revoke old API key during rotation: {}",
-                id
-            ))?;
-
-        let new_key = self
-            .create_api_key(
-                wallet_address,
-                CreateApiKeyRequest {
-                    name: old_key.name,
-                    scopes: Some(old_key.scopes),
-                    expires_at: old_key.expires_at,
-                },
-            )
-            .await
-            .context(format!(
-                "Failed to create new API key during rotation for wallet: {}",
-                wallet_address
-            ))?;
+            .context(format!("Failed to fetch newly rotated API key id: {}", new_id))?;
 
         Ok(Some(CreateApiKeyResponse {
             key: ApiKeyInfo::from(new_key),
