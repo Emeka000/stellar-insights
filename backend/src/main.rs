@@ -102,7 +102,16 @@ async fn main() -> anyhow::Result<()> {
 
     let db_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "sqlite://stellar_insights.db".to_string());
-    let pool = PoolConfig::from_env()
+    let pool_config = PoolConfig::from_env();
+    tracing::info!(
+        max_connections = pool_config.max_connections,
+        min_connections = pool_config.min_connections,
+        connect_timeout_secs = pool_config.connect_timeout_seconds,
+        idle_timeout_secs = pool_config.idle_timeout_seconds,
+        max_lifetime_secs = pool_config.max_lifetime_seconds,
+        "Database pool configuration"
+    );
+    let pool = pool_config
         .create_pool(&db_url)
         .await
         .context("Failed to create database pool")?;

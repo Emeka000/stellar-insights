@@ -21,7 +21,16 @@ use crate::models::{
     MetricRecord, MuxedAccountAnalytics, MuxedAccountUsage, SnapshotRecord,
 };
 
-/// Configuration for database connection pool
+/// Configuration for database connection pool.
+///
+/// All fields are configurable via environment variables:
+/// - `DB_POOL_MAX_CONNECTIONS` (default: 10)
+/// - `DB_POOL_MIN_CONNECTIONS` (default: 2)
+/// - `DB_POOL_CONNECT_TIMEOUT_SECONDS` (default: 30)
+/// - `DB_POOL_IDLE_TIMEOUT_SECONDS` (default: 600)
+/// - `DB_POOL_MAX_LIFETIME_SECONDS` (default: 1800)
+///
+/// Use `PoolConfig::from_env()` in production to load values from the environment.
 #[derive(Debug, Clone)]
 pub struct PoolConfig {
     pub max_connections: u32,
